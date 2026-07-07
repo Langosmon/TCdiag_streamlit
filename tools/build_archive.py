@@ -147,74 +147,113 @@ def _atomic_write(ds: xr.Dataset, path: Path, encoding: dict) -> None:
     os.replace(tmp, path)
 
 
-# ─────────── ERA5 loading (parallel THREDDS opens) ────────────────────────────
+# ─────────── ERA5 loading (process pool; netCDF-C is NOT thread-safe) ─────────
 
-def open_month_lazy(year: int, month: int, verbose: bool = True) -> xr.Dataset:
-    """Open the 7 ERA5 monthly-mean THREDDS datasets and merge one month, LAZILY.
+# Pressure levels (hPa) each input actually needs. U/V/VO only feed
+# level-selected terms (200/850 hPa shear, 850 hPa vorticity), so skipping the
+# other 30+ levels cuts their THREDDS transfer >10x. T/Q keep the full PI
+# profile (tcpyPI integrates up to ptop=50 hPa; 600 hPa also feeds Chi).
+# Keep in sync with tcdiag_data._LEVELS_NEEDED.
+LEVELS_NEEDED: Dict[str, Optional[object]] = {
+    "SSTK": None, "SP": None,
+    "T": (50, 1000), "Q": (50, 1000),
+    "U": [200, 850], "V": [200, 850], "VO": [850],
+}
 
-    Re-implements the loop of tcpyVPI.era5_loader.load_era5_monthly but opens
-    the seven remote datasets in parallel threads: sequential opens take ~30 s
-    while parallel opens take ~5-8 s (the opens are metadata round-trips, so
-    they thread well). Falls back to load_era5_monthly if the private URL
-    builder is not importable from the installed tcpyVPI.
 
-    Returns a LAZY dataset -- no field data has been transferred yet. Subset
-    (see subset_domain) BEFORE calling .load() so only the tropics band at the
-    target stride crosses the wire.
+def fetch_month_field(job: Tuple) -> dict:
+    """Fetch ONE ERA5 variable for one month; runs in a worker PROCESS.
+
+    Top-level (hence picklable) worker for ProcessPoolExecutor, mirroring
+    tcdiag_fetch.fetch_field in the app repo: the netCDF-C/HDF5 stack is NOT
+    thread-safe for concurrent OPeNDAP opens (threaded opens crash with DAP
+    server / HDF5 errors), so parallelism must come from processes. Opens
+    lazily, subsets (month, levels, latitude band, stride) BEFORE .load() so
+    only the needed slab crosses the wire, and returns plain numpy so nothing
+    holding netCDF C handles crosses the process boundary.
     """
-    try:
-        from tcpyVPI.era5_loader import _get_monthly_mean_url
-    except ImportError:
-        from tcpyVPI.era5_loader import load_era5_monthly
-        if verbose:
-            print("  (tcpyVPI URL builder not importable -> sequential load_era5_monthly)")
-        return load_era5_monthly(year, month, verbose=verbose)
+    var, url, month_idx, levels, north, south, stride = job
+    import xarray as xr  # local import: cheap for spawned workers
 
-    def _open(var: str, is_surface: bool):
-        url = _get_monthly_mean_url(var, year, is_surface=is_surface)
-        return var, xr.open_dataset(url)  # lazy: reads metadata only
+    ds = xr.open_dataset(url)                    # lazy: metadata only
+    da = None
+    for k in (var, var.upper(), f"VAR_{var.upper()}"):
+        if k in ds:
+            da = ds[k]
+            break
+    if da is None:
+        da = ds[list(ds.data_vars)[0]]
 
-    jobs = [(v, True) for v in SURFACE_VARS] + [(v, False) for v in PRESSURE_VARS]
-    opened = {}
-    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-        for fut in [pool.submit(_open, v, s) for v, s in jobs]:
-            var, ds = fut.result()
-            opened[var] = ds
-
-    idx = month - 1  # yearly files hold 12 months
-    return xr.merge([opened[v][v].isel(time=idx) for v in SURFACE_VARS + PRESSURE_VARS])
-
-
-def subset_domain(ds: xr.Dataset, north: float, south: float, stride: int) -> xr.Dataset:
-    """Lazily subset to the latitude band and coarsen by `stride`.
-
-    ERA5 latitude runs DESCENDING (90 -> -90), so the band selection is
-    slice(north, south), e.g. slice(40, -40). stride=2 keeps every 2nd point
-    of the 0.25 deg grid -> 0.5 deg. Applied before .load(), this cuts the
-    transfer by ~18x versus pulling the full global grid.
-    """
-    ds = ds.sel({LAT: slice(north, south)})
+    da = da.isel(time=month_idx)                 # yearly files hold 12 months
+    if levels is not None and "level" in da.dims:
+        da = (da.sel(level=slice(levels[0], levels[1])) if isinstance(levels, tuple)
+              else da.sel(level=levels))
+    da = da.sel({LAT: slice(north, south)})      # ERA5 latitude DESCENDS 90 -> -90
     if stride > 1:
-        ds = ds.isel({LAT: slice(None, None, stride), LON: slice(None, None, stride)})
-    return ds
+        da = da.isel({LAT: slice(None, None, stride), LON: slice(None, None, stride)})
+    da = da.load()                               # <-- the actual data transfer
+
+    out = {"name": var, "values": da.values.astype(np.float32), "dims": da.dims,
+           LAT: da[LAT].values, LON: da[LON].values}
+    if "level" in da.dims:
+        out["level"] = da["level"].values
+    ds.close()
+    return out
+
+
+def fetch_month_inputs(year: int, month: int, north: float, south: float,
+                       stride: int, workers: int = 7) -> xr.Dataset:
+    """All 7 ERA5 inputs for one month, subset and merged, ready for tcpyVPI.
+
+    workers > 1 fetches the variables in parallel PROCESSES (never threads --
+    see fetch_month_field); workers = 1 runs the same worker sequentially
+    in-process, which is always safe, just slower wall-clock.
+    """
+    from tcpyVPI.era5_loader import _get_monthly_mean_url
+
+    jobs = [(v, _get_monthly_mean_url(v, year, is_surface=(v in SURFACE_VARS)),
+             month - 1, LEVELS_NEEDED[v], north, south, stride)
+            for v in SURFACE_VARS + PRESSURE_VARS]
+
+    if workers > 1:
+        with ProcessPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+            results = list(pool.map(fetch_month_field, jobs))
+    else:
+        results = [fetch_month_field(j) for j in jobs]
+
+    arrays = []
+    for r in results:
+        coords = {LAT: r[LAT], LON: r[LON]}
+        if "level" in r:
+            coords["level"] = r["level"]
+        arrays.append(xr.DataArray(r["values"], dims=r["dims"], coords=coords,
+                                   name=r["name"]))
+    # join="outer" is safe: T/Q carry the superset of levels, so U/V/VO just
+    # get NaN-padded at levels their formulas never select (they only ever
+    # .sel() their own 200/850 hPa levels).
+    return xr.merge(arrays, join="outer")
 
 
 def process_month(year: int, month: int, north: float, south: float,
-                  stride: int, verbose: bool = True) -> xr.Dataset:
+                  stride: int, workers: int = 7, verbose: bool = True) -> xr.Dataset:
     """Load one (year, month), compute all diagnostics, return a (time=1) Dataset.
 
-    Cost profile (0.5 deg, 40S-40N): transfer dominates at ~90 s per month
-    from RDA; the pointwise PI/GPIv compute is a few seconds.
+    Cost profile (0.5 deg, 40S-40N): RDA open+transfer dominates at ~1-2 min
+    per month; the pointwise PI/GPIv compute is a few seconds.
     """
     from tcpyVPI.vpigpiv_module import compute_gpiv_from_dataset
 
     t0 = time.perf_counter()
-    ds = subset_domain(open_month_lazy(year, month, verbose=verbose), north, south, stride)
-    t1 = time.perf_counter()
-    ds = ds.load()                       # <-- the actual data transfer
+    ds = fetch_month_inputs(year, month, north, south, stride, workers=workers)
     t2 = time.perf_counter()
 
     res = compute_gpiv_from_dataset(ds, verbose=False)[VARIABLES]
+
+    # +/-inf -> NaN: ventilation_index = VWS*Chi/PI blows up where PI -> 0 and
+    # Chi where asdeq -> 0 (cold band edges near 40N/S). Undefined there, and
+    # infs would poison the climatology mean/std at those pixels.
+    for v in VARIABLES:
+        res[v] = res[v].where(np.isfinite(res[v]))
 
     # Scrub scalar leftovers (input time stamp, level=850 from eta_c, ...) and
     # index by the month start so decade files concat cleanly along time.
@@ -231,8 +270,7 @@ def process_month(year: int, month: int, north: float, south: float,
     ))
     t3 = time.perf_counter()
     if verbose:
-        print(f"  {year}-{month:02d}: open {t1 - t0:.0f} s | transfer {t2 - t1:.0f} s "
-              f"| compute {t3 - t2:.0f} s "
+        print(f"  {year}-{month:02d}: fetch {t2 - t0:.0f} s | compute {t3 - t2:.0f} s "
               f"({res.sizes[LAT]}x{res.sizes[LON]} grid)")
     return res
 
@@ -397,10 +435,19 @@ def cmd_monthly(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
+    if not args.consolidate_only:
+        try:  # fail fast, not once per month
+            from tcpyVPI.era5_loader import _get_monthly_mean_url  # noqa: F401
+            from tcpyVPI.vpigpiv_module import compute_gpiv_from_dataset  # noqa: F401
+        except ImportError as e:
+            print(f"FATAL: tcpyVPI not importable ({e}). "
+                  f"One-time setup: pip install tcpyVPI tcpyPI", file=sys.stderr)
+            return 2
+
     print(f"Archive dir : {out.resolve()}")
     print(f"Years       : {y0}-{y1} (full archive period {fp0}-{fp1})")
     print(f"Domain      : latitude {north} to {south}, stride {args.stride} "
-          f"({0.25 * args.stride} deg)")
+          f"({0.25 * args.stride} deg), fetch workers {args.workers}")
 
     n_ok = n_skip = n_fail = 0
     if not args.consolidate_only:
@@ -411,7 +458,8 @@ def cmd_monthly(args: argparse.Namespace) -> int:
                     n_skip += 1
                     continue
                 try:
-                    res = process_month(year, month, north, south, args.stride)
+                    res = process_month(year, month, north, south, args.stride,
+                                        workers=args.workers)
                     write_month(res, out, year, month)
                     n_ok += 1
                 except Exception as e:                       # noqa: BLE001 -- keep going
@@ -511,8 +559,12 @@ def cmd_climatology(args: argparse.Namespace) -> int:
             means.append(yearly.mean("year"))
             stds.append(yearly.std("year", ddof=1))
         season_ix = pd.Index([name for name, _ in SEASONS], name="season")
-        smean = xr.concat(means, dim=season_ix)
-        sstd = xr.concat(stds, dim=season_ix)
+        # concat turns the pandas string index into a numpy StringDType coord,
+        # which the netCDF4 backend refuses to write -- pin it to fixed-width
+        # unicode (round-trips through netCDF as plain strings).
+        season_names = np.array([name for name, _ in SEASONS], dtype="U")
+        smean = xr.concat(means, dim=season_ix).assign_coords(season=season_names)
+        sstd = xr.concat(stds, dim=season_ix).assign_coords(season=season_names)
         smean.attrs, sstd.attrs = dict(mean.attrs), dict(std.attrs)
 
         attrs_s = _global_attrs(base_period=f"{y0}-{y1}",
@@ -650,6 +702,10 @@ def main() -> int:
                    help="latitude band 'north,south' (default 40,-40; full longitude)")
     p.add_argument("--stride", type=int, default=2,
                    help="grid stride on the 0.25 deg grid (default 2 = 0.5 deg)")
+    p.add_argument("--workers", type=int, default=7,
+                   help="parallel fetch PROCESSES, one per ERA5 input "
+                        "(default 7; 1 = sequential; never threads -- "
+                        "netCDF-C is not thread-safe for concurrent opens)")
     p.add_argument("--full-period", default="1980-2024",
                    help="full archive period; decades are consolidated only once "
                         "every month of the decade inside this period is done")

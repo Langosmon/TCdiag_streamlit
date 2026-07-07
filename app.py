@@ -168,10 +168,11 @@ if show_anom and da is not None:
     try:
         clim = D.load_climatology(var, seasonal=False)
         clim_month = clim[var].sel(month=mon if mode == "Monthly" else sel_date.month)
-        # Align grids: live-computed fields may be 1°, climatology is 0.5°.
+        # Align grids: archive and live fields may differ in resolution
+        # (bilinear, not nearest — nearest would checkerboard-NaN when the
+        # grids don't share points).
         if clim_month.sizes != da.sizes:
-            clim_month = clim_month.reindex_like(da, method="nearest",
-                                                 tolerance=0.26)
+            clim_month = clim_month.interp_like(da)
         da = da - clim_month
         cmap = cmap_anom
         units = (units + " " if units != "–" else "") + "anomaly"

@@ -27,11 +27,13 @@
                                    # omit to use your default account. Note the
                                    # standby queue caps walltime at 4 h.
 
-set -euo pipefail
-
+set -eo pipefail                   # -u only after activation: conda's activate
+                                   # scripts read unset vars (PS1, ...) and
+                                   # would abort under `set -u`
 module purge
 module load anaconda
 source activate research_env       # envs live in ~/.conda/envs
+set -u
 
 cd "${SLURM_SUBMIT_DIR}"
 
