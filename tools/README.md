@@ -2,7 +2,7 @@
 
 `build_archive.py` precomputes the 7 diagnostics (GPIv, vPI, PI,
 ventilation_index, VWS, Chi, eta_c) from ERA5 monthly means (NCAR RDA
-d633001, OPeNDAP) for 1980–2024 on a 40°S–40°N band at 0.5°, and produces
+d633001, OPeNDAP) for 1980–2022 on a 40°S–40°N band at 0.5° (or 1° with --stride 4; release v1 was built at 1° locally), and produces
 exactly the files `../tcdiag_data.py` expects on the GitHub Release:
 
 | file | dims | contents |
@@ -33,7 +33,7 @@ pip install tcpyVPI tcpyPI
 ```bash
 cd ~/TCdiag_streamlit          # repo root (submit dir matters)
 mkdir -p logs
-sbatch tools/run_archive.slurm # array 1980-2024, 45 tasks
+sbatch tools/run_archive.slurm # array 1980-2022, 45 tasks
 ```
 
 Each task runs
@@ -57,9 +57,9 @@ Local reads only (no downloads) — a small single job or even the login node:
 OUT=/scratch/negishi/jocegue/tcdiag_archive
 CLIM=/scratch/negishi/jocegue/tcdiag_clim
 # fold any leftover per-month files into the decade files:
-python tools/build_archive.py monthly --years 1980-2024 --out "$OUT" --consolidate-only
+python tools/build_archive.py monthly --years 1980-2022 --out "$OUT" --consolidate-only
 # per-calendar-month + seasonal (JJA/SON/JJASON) mean/std, ddof=1:
-python tools/build_archive.py climatology --years 1980-2024 --archive "$OUT" --out "$CLIM"
+python tools/build_archive.py climatology --years 1980-2022 --archive "$OUT" --out "$CLIM"
 ```
 
 (A ready-made single-job script is in the comment block at the bottom of
@@ -88,8 +88,8 @@ available there, otherwise `scp` the 49 files to your laptop first):
 ```bash
 gh release create tcdiag-v1 \
     --repo Langosmon/TCdiag_streamlit \
-    --title "TC-diagnostics archive v1 (ERA5 1980-2024, 0.5deg, 40S-40N)" \
-    --notes "Monthly archive + 1980-2024 monthly/seasonal climatology built by tools/build_archive.py. See tools/README.md." \
+    --title "TC-diagnostics archive v1 (ERA5 1980-2022, 0.5deg, 40S-40N)" \
+    --notes "Monthly archive + 1980-2022 monthly/seasonal climatology built by tools/build_archive.py. See tools/README.md." \
     /scratch/negishi/jocegue/tcdiag_archive/tcdiag__*.nc \
     /scratch/negishi/jocegue/tcdiag_clim/tcdiag_clim*.nc
 ```
@@ -114,7 +114,7 @@ re-probe).
 
 * Keep `--domain`/`--stride` identical across all runs feeding one archive
   directory (grids must match for the decade concat). Defaults: `40,-40`,
-  stride 2 (0.5°).
+  stride 2 (0.5° (or 1° with --stride 4; release v1 was built at 1° locally)).
 * `--workers N` controls the fetch process pool (default 7, one per ERA5
   input; `1` = sequential). Never convert this to threads.
 * Running elsewhere: only `--out`/paths are cluster-specific; the script

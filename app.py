@@ -3,21 +3,21 @@
 Built on the lab's tcpyVPI package (Chavas, Camargo & Tippett 2025, J. Clim.;
 github.com/drchavas/tcpyVPI). Three modes:
 
-  Climatology   1980–2024 monthly + seasonal (JJA/SON/JJASON) means and
+  Climatology   1980–2022 monthly + seasonal (JJA/SON/JJASON) means and
                 interannual stds — precomputed, loads instantly.
-  Monthly       any month 1980–2024, with anomalies vs the climatology —
+  Monthly       any month 1980–2022, with anomalies vs the climatology —
                 precomputed archive, live-computed fallback.
   Daily (6-h)   any 00/06/12/18 UTC snapshot, computed live from ERA5 via
                 RDA THREDDS (~1–2 min first time, then cached), with
                 anomalies vs the monthly climatology.
 
-Domain: 40°S–40°N. Archive at 0.5°; live computation at 1° (0.5° optional).
+Domain: 40°S–40°N. Archive resolution is set by the published release
+(v1 is 1°; a 0.5° rebuild on the cluster can replace it as a new tag);
+live computation is 1° by default with a 0.5° option.
 """
 
-import calendar
 import datetime
 import numpy as np
-import xarray as xr
 import streamlit as st
 
 import _common as C
@@ -27,7 +27,7 @@ import tcdiag_data as D
 # ─── page setup ───────────────────────────────────────────────────────────────
 C.configure_page(
     title="TC Diagnostics · vPI / GPIv",
-    subtitle="Ventilated potential intensity and genesis potential, 1980–2024. "
+    subtitle="Ventilated potential intensity and genesis potential, 1980–2022. "
              "Powered by tcpyVPI (Chavas, Camargo & Tippett 2025).",
     icon="🌪️",
 )
@@ -48,7 +48,7 @@ st.sidebar.header("Mode")
 mode = st.sidebar.radio(
     "Time aggregation",
     ("Climatology", "Monthly", "Daily (6-hourly)"),
-    help="Climatology and Monthly load from the precomputed 1980–2024 "
+    help="Climatology and Monthly load from the precomputed 1980–2022 "
          "archive. Daily maps are computed live from ERA5 (~1–2 min the "
          "first time, then cached).",
 )
@@ -63,7 +63,7 @@ loaded_note = None
 if mode == "Climatology":
     if not HAVE_ARCHIVE:
         st.info(
-            "**The 1980–2024 archive hasn't been published yet.** "
+            "**The 1980–2022 archive hasn't been published yet.** "
             "Run `tools/build_archive.py` on the cluster and upload the "
             "release (see `tools/README.md`). Until then, the Monthly and "
             "Daily modes still work — they compute live from ERA5."
@@ -72,7 +72,7 @@ if mode == "Climatology":
     kind = st.sidebar.radio("Period", ("Month", "Season"), horizontal=True)
     show_std = st.sidebar.toggle(
         "Show interannual σ", value=False,
-        help="Standard deviation across the 45 years instead of the mean.")
+        help="Standard deviation across the 43 years instead of the mean.")
     try:
         if kind == "Month":
             mon = st.sidebar.selectbox("Month", range(1, 13),
@@ -81,15 +81,19 @@ if mode == "Climatology":
             ds = D.load_climatology(var, seasonal=False)
             key = f"{var}_STD" if show_std and f"{var}_STD" in ds else var
             da = ds[key].sel(month=mon)
-            title += f" · {MONTH_NAMES[mon - 1]} climatology (1980–2024)"
+            title += f" · {MONTH_NAMES[mon - 1]} climatology (1980–2022)"
         else:
             season = st.sidebar.selectbox("Season", D.SEASONS, index=2)
             ds = D.load_climatology(var, seasonal=True)
             key = f"{var}_STD" if show_std and f"{var}_STD" in ds else var
             da = ds[key].sel(season=season)
-            title += f" · {season} climatology (1980–2024)"
+            title += f" · {season} climatology (1980–2022)"
         if show_std:
-            title += " · σ"
+            if key.endswith("_STD"):
+                title += " · σ"
+            else:
+                st.warning("This climatology file has no σ variable — "
+                           "showing the mean instead.")
     except FileNotFoundError as e:
         st.error(str(e))
         st.stop()
@@ -101,7 +105,7 @@ elif mode == "Monthly":
     mon = col_m.selectbox("Month", range(1, 13),
                           format_func=lambda m: MONTH_NAMES[m - 1], index=8)
     show_anom = st.sidebar.toggle(
-        "Anomaly (vs 1980–2024 climatology)", value=False,
+        "Anomaly (vs 1980–2022 climatology)", value=False,
         disabled=not HAVE_ARCHIVE,
         help=None if HAVE_ARCHIVE else "Needs the published climatology.")
     title += f" · {MONTH_NAMES[mon - 1]} {yr}"
@@ -110,21 +114,25 @@ elif mode == "Monthly":
         da = D.load_archive_month(var, yr, mon)
         loaded_note = "archive"
     except Exception:
-        st.info(
-            f"**{MONTH_NAMES[mon - 1]} {yr} isn't in the published archive"
-            f"{'' if HAVE_ARCHIVE else ' (none published yet)'}** — "
-            "it can be computed live from ERA5 instead (~1–2 min, cached)."
-        )
-        if st.button("🔄 Compute this month live from ERA5", type="primary"):
-            with st.status("Computing from ERA5 via RDA…", expanded=True) as s:
-                st.write("Opening 7 THREDDS datasets in parallel…")
-                res = D.compute_live(yr, mon, None, None, stride=4)
-                st.write("Done — all 7 diagnostics cached for this month.")
-                s.update(label="Computed.", state="complete")
-            da = res[var]
-            loaded_note = "live (1°)"
-        else:
+        # Persist the live-compute choice: an ephemeral button would blank
+        # the app on the next widget interaction (every rerun re-raises the
+        # archive miss and st.stop()s before the map).
+        if st.session_state.get("live_month") != (yr, mon):
+            st.info(
+                f"**{MONTH_NAMES[mon - 1]} {yr} isn't in the published archive"
+                f"{'' if HAVE_ARCHIVE else ' (none published yet)'}.** "
+                "It can be computed live from ERA5 instead (about a minute, "
+                "then cached)."
+            )
+            if st.button("🔄 Compute this month live from ERA5", type="primary"):
+                st.session_state["live_month"] = (yr, mon)
+                st.rerun()
             st.stop()
+        with st.status("Computing from ERA5 via RDA…", expanded=False) as s:
+            res = D.compute_live(yr, mon, None, None, stride=4)
+            s.update(label="Computed (cached for this month).", state="complete")
+        da = res[var]
+        loaded_note = "live (1°)"
 
 # ─── mode: daily 6-hourly ────────────────────────────────────────────────────
 else:
@@ -132,7 +140,9 @@ else:
     sel_date = col_d.date_input(
         "Date (UTC)", value=datetime.date(2023, 10, 25),
         min_value=datetime.date(1940, 1, 1),
-        max_value=datetime.date.today() - datetime.timedelta(days=6))
+        max_value=datetime.date.today() - datetime.timedelta(days=6),
+        help="NCAR RDA can lag ERA5 by weeks; very recent dates may not "
+             "exist yet and will show a friendly error.")
     sel_hour = col_h.selectbox("Hour", [0, 6, 12, 18], index=1)
     res_choice = st.sidebar.radio("Resolution", ("1° (fast)", "0.5° (slower)"),
                                   horizontal=True)
@@ -140,7 +150,7 @@ else:
     show_anom = st.sidebar.toggle(
         "Anomaly (vs monthly climatology)", value=False,
         disabled=not HAVE_ARCHIVE,
-        help="Departure from the 1980–2024 mean of the calendar month. "
+        help="Departure from the 1980–2022 mean of the calendar month. "
              "Instantaneous snapshots retain diurnal + synoptic variability."
              if HAVE_ARCHIVE else "Needs the published climatology.")
     title += f" · {sel_date} {sel_hour:02d} UTC"
@@ -170,13 +180,22 @@ if show_anom and da is not None:
         clim_month = clim[var].sel(month=mon if mode == "Monthly" else sel_date.month)
         # Align grids: archive and live fields may differ in resolution
         # (bilinear, not nearest — nearest would checkerboard-NaN when the
-        # grids don't share points).
+        # grids don't share points). Pad the longitude seam cyclically so
+        # interp doesn't leave an all-NaN column at the last source lon.
         if clim_month.sizes != da.sizes:
+            import xarray as xr
+            wrap = clim_month.isel(longitude=0)
+            wrap = wrap.assign_coords(longitude=wrap.longitude + 360.0)
+            clim_month = xr.concat([clim_month, wrap], dim="longitude")
             clim_month = clim_month.interp_like(da)
         da = da - clim_month
         cmap = cmap_anom
         units = (units + " " if units != "–" else "") + "anomaly"
         title += " · anomaly"
+    except ImportError as e:
+        st.error(f"Anomaly regridding needs scipy — deployment bug, not a "
+                 f"data problem: {e}")
+        show_anom = False
     except Exception as e:
         st.warning(f"Climatology unavailable — showing the full field.\n\n{e}")
         show_anom = False

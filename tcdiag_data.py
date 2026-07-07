@@ -1,7 +1,7 @@
 """Data access for the TC-diagnostics app.
 
 Three tiers, fastest first:
-  1. Climatology files (1980–2024 monthly + seasonal means/stds) — published
+  1. Climatology files (1980–2022 monthly + seasonal means/stds; RDA's monthly dataset ends at 2022) — published
      on a GitHub Release, fetched once, cached in /tmp.
   2. Monthly archive (one file per variable per decade) — same Release.
   3. Live computation from ERA5 via tcpyVPI — used for daily 6-hourly maps
@@ -9,11 +9,12 @@ Three tiers, fastest first:
      the archive is published. RDA transfer dominates the cost (~1–2 min);
      the PI computation itself is seconds on the subset grid.
 
-All fields are on a 40°S–40°N tropical band. Archive/climatology are 0.5°;
-live computation defaults to 1° (stride 4) for speed with a 0.5° option.
+All fields are on a 40°S–40°N tropical band. Archive/climatology resolution
+follows the published release (v1 is 1°); live computation defaults to 1°
+(stride 4) for speed with a 0.5° option. Anomalies regrid automatically.
 
 File-name contract with tools/build_archive.py (keep in sync):
-  tcdiag__{var}__{decade}s.nc            (time, latitude, longitude)
+  tcdiag__{var}__{decade}.nc            (e.g. tcdiag__vPI__1980s.nc)            (time, latitude, longitude)
   tcdiag_clim__{var}.nc                  (month:12, ...)  {VAR}, {VAR}_STD
   tcdiag_clim_seasonal__{var}.nc         (season:3, ...)  {VAR}, {VAR}_STD
 """
@@ -42,7 +43,7 @@ DIAGNOSTICS: dict[str, tuple] = {
 }
 
 SEASONS = ["JJA", "SON", "JJASON"]
-YEARS = list(range(1980, 2025))
+YEARS = list(range(1980, 2023))   # RDA d633001 monthly means end at 2022
 
 RELEASE_BASE = "https://github.com/Langosmon/TCdiag_streamlit/releases/download"
 RELEASE_TAG = "tcdiag-v1"
@@ -58,7 +59,7 @@ def _release_local(name: str) -> Path:
     return cache / name
 
 
-@st.cache_resource(show_spinner="Fetching archive…")
+@st.cache_resource(show_spinner="Fetching archive…", max_entries=16)
 def _release_dataset(name: str) -> xr.Dataset:
     """Download (once) + open (once) a Release asset, fully in memory."""
     local = _release_local(name)
@@ -178,4 +179,10 @@ def compute_live(year: int, month: int, day: Optional[int], hour: Optional[int],
     # join="outer" is safe here: T/Q carry the superset of levels, so U/V/VO
     # just get NaN-padded at levels their formulas never select.
     ds = xr.merge(arrays.values(), join="outer")
-    return compute_gpiv_from_dataset(ds, verbose=False)
+    res = compute_gpiv_from_dataset(ds, verbose=False)
+    # Scrub ±inf → NaN (VI = VWS·χ/PI blows up where PI→0 at the band edges;
+    # same scrub the archive builder applies, so live and archived fields
+    # agree — and an inf reaching the colour-bar sliders crashes Streamlit).
+    for v in res.data_vars:
+        res[v] = res[v].where(np.isfinite(res[v]))
+    return res

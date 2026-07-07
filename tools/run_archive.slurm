@@ -16,7 +16,7 @@
 #     pip install tcpyVPI tcpyPI
 # =============================================================================
 #SBATCH --job-name=tcdiag
-#SBATCH --array=1980-2024
+#SBATCH --array=1980-2022
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4

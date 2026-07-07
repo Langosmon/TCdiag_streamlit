@@ -4,6 +4,7 @@ netCDF4
 plotly>=6
 numpy
 pandas
+scipy
 requests
 tcpyPI
 tcpyVPI
