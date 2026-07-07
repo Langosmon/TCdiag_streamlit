@@ -1,0 +1,14 @@
+# Streamlit theme — follows the visitor's light/dark preference (no pinned
+# base/background) so the site embed matches langosmon.github.io's theme.
+# Terracotta accent (Jalisco sunset) shared with the site.
+[theme]
+primaryColor        = "#d97757"
+font                = "sans-serif"
+
+[server]
+runOnSave           = false
+enableCORS          = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats    = false
